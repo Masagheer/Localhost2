@@ -1,40 +1,28 @@
 use std::net::{TcpListener, TcpStream};
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd}; 
-// AsRawFd lets us extract the file descriptor (int) from TcpStream/TcpListener
-// epoll works ONLY with file descriptors
-
 use std::collections::HashMap;
 use libc::{
-    epoll_create1, // creates an epoll instance (kernel object)
-    epoll_ctl,     // add/remove/modify fds in epoll
-    epoll_wait,    // wait for events
-    epoll_event,   // struct describing an event
-    EPOLLIN,       // fd is ready to READ
-    EPOLLERR,      // error occurred
-    EPOLLHUP,      // hang up (client disconnected)
-    EPOLL_CTL_ADD, // operation: add fd
-    EPOLL_CTL_DEL, // operation: remove fd
+    epoll_create1, epoll_ctl, epoll_wait, epoll_event,
+    EPOLLIN, EPOLLERR, EPOLLHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL,
 };
 
 const MAX_EVENTS: usize = 1024;
-const TIMEOUT_MS: i32 = 1000; // 1 second timeout
+const TIMEOUT_MS: i32 = 1000;
 
 struct Connection {
     stream: TcpStream,
 }
 
 struct Server {
-    listener: TcpListener,
-    port: u16,
+    listeners: Vec<TcpListener>,
     epoll_fd: RawFd,
     connections: HashMap<RawFd, Connection>,
 }
 
 impl Server {
-    pub fn new(port: u16) -> io::Result<Server> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-        listener.set_nonblocking(true)?;
+    pub fn new(ports: &[u16]) -> io::Result<Server> {
+        let mut listeners = Vec::new();
         
         // Create epoll instance
         let epoll_fd = unsafe { epoll_create1(0) };
@@ -42,30 +30,34 @@ impl Server {
             return Err(io::Error::last_os_error());
         }
 
-        // Add listener to epoll
-        let mut event = epoll_event {
-            events: EPOLLIN as u32, //tells you when fd is ready to read
-            u64: listener.as_raw_fd() as u64,
-        };
+        // Create listeners for each port
+        for &port in ports {
+            let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+            listener.set_nonblocking(true)?;
+            
+            // Add listener to epoll
+            let mut event = epoll_event {
+                events: EPOLLIN as u32,
+                u64: listener.as_raw_fd() as u64,
+            };
 
-        unsafe {
-        //the listener is officially registered in epoll.
-            if epoll_ctl(
-                epoll_fd,
-                EPOLL_CTL_ADD, //add this fd
-                listener.as_raw_fd(), //which fd
-                &mut event as *mut epoll_event, //what events we care about
-            ) < 0 {
-                return Err(io::Error::last_os_error());
+            unsafe {
+                if epoll_ctl(
+                    epoll_fd,
+                    EPOLL_CTL_ADD,
+                    listener.as_raw_fd(),
+                    &mut event as *mut epoll_event,
+                ) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
+            
+            println!("Server listening on http://localhost:{}/", port);
+            listeners.push(listener);
         }
         
-        println!("Server started on http://localhost:{}/", port);
-        
-        //return this as Result<Server>
         Ok(Server {
-            listener,
-            port,
+            listeners,
             epoll_fd,
             connections: HashMap::new(),
         })
@@ -77,38 +69,30 @@ impl Server {
         loop {
             let num_events = unsafe {
                 epoll_wait(
-                    self.epoll_fd, //which epoll instance
-                    events.as_mut_ptr(), //where to store events - inside the events vec! we created so it creates it as mutation to a pointer
-                    MAX_EVENTS as i32, //max events to return
-                    TIMEOUT_MS, //wait 1 second
+                    self.epoll_fd,
+                    events.as_mut_ptr(),
+                    MAX_EVENTS as i32,
+                    TIMEOUT_MS,
                 )
             };
-						// if epoll_wait failed
+
             if num_events < 0 {
                 return Err(io::Error::last_os_error());
             }
-						//loop over the events
+
             for i in 0..num_events as usize {
-		            //we stored the fd in events.u64 now we retrieve it to know which socket triggered the event
                 let fd = events[i].u64 as RawFd;
 
-                if fd == self.listener.as_raw_fd() {
-		                //the listening socket is readable
-		                //a new client wwants to connect
-                    // Handle new connection
-                    self.accept_connection()?;
+                // Check if this fd belongs to any of our listeners
+                if self.listeners.iter().any(|l| l.as_raw_fd() == fd) {
+                    self.accept_connection(fd)?;
                 } else {
-		                // This event belongs to an already connected client
-                    // Handle existing connection
                     if events[i].events & (EPOLLERR as u32 | EPOLLHUP as u32) != 0 {
-		                    // EPOLLERR → socket error
-										    // EPOLLHUP → client disconnected
                         self.remove_connection(fd)?;
                         continue;
                     }
 
                     if events[i].events & EPOLLIN as u32 != 0 {
-		                    // Kernel says: this socket has data to read
                         if let Err(_) = self.handle_client_data(fd) {
                             self.remove_connection(fd)?;
                         }
@@ -118,8 +102,13 @@ impl Server {
         }
     }
 
-    fn accept_connection(&mut self) -> io::Result<()> {
-        match self.listener.accept() {
+    fn accept_connection(&mut self, listener_fd: RawFd) -> io::Result<()> {
+        // Find the correct listener
+        let listener = self.listeners.iter()
+            .find(|l| l.as_raw_fd() == listener_fd)
+            .unwrap();
+
+        match listener.accept() {
             Ok((stream, addr)) => {
                 println!("New connection from: {}", addr);
                 stream.set_nonblocking(true)?;
@@ -132,18 +121,16 @@ impl Server {
 
                 unsafe {
                     if epoll_ctl(
-	                    self.epoll_fd, 
-	                    EPOLL_CTL_ADD, //Add client fd
-	                    fd, 
-	                    &mut event as *mut epoll_event
+                        self.epoll_fd,
+                        EPOLL_CTL_ADD,
+                        fd,
+                        &mut event as *mut epoll_event
                     ) < 0 {
                         return Err(io::Error::last_os_error());
                     }
                 }
 
-                self.connections.insert(fd, Connection {
-                    stream,
-                });
+                self.connections.insert(fd, Connection { stream });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => eprintln!("Error accepting connection: {}", e),
@@ -151,13 +138,10 @@ impl Server {
         Ok(())
     }
 
+    // ... rest of the implementation remains the same ...
     fn remove_connection(&mut self, fd: RawFd) -> io::Result<()> {
         unsafe {
-            epoll_ctl(
-	            self.epoll_fd, 
-		          EPOLL_CTL_DEL, //remove fd
-		          fd, 
-		          std::ptr::null_mut());
+            epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, std::ptr::null_mut());
         }
         self.connections.remove(&fd);
         Ok(())
@@ -168,7 +152,6 @@ impl Server {
             let mut buffer = [0; 4096];
             match connection.stream.read(&mut buffer) {
                 Ok(0) => {
-                    // Connection closed by client
                     println!("Connection closed by client");
                     return Err(io::Error::new(io::ErrorKind::Other, "Connection closed"));
                 }
@@ -194,21 +177,18 @@ impl Server {
 
         if should_send_response {
             if let Some(conn) = self.connections.get_mut(&fd) {
-                Self::send_response(&mut conn.stream, self.port)?;
+                Self::send_response(&mut conn.stream)?;
             }
         }
         Ok(())
     }
     
-    fn send_response(stream: &mut TcpStream, port: u16) -> io::Result<()> {
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/html\r\n\
-             Content-Length: 98\r\n\
-             \r\n\
-             <html><body><h1>Hello from Rust Server on port {}!</h1><p>Your request was received.</p></body></html>",
-            port
-        );
+    fn send_response(stream: &mut TcpStream) -> io::Result<()> {
+        let response = "HTTP/1.1 200 OK\r\n\
+                       Content-Type: text/html\r\n\
+                       Content-Length: 82\r\n\
+                       \r\n\
+                       <html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>";
         
         stream.write_all(response.as_bytes())?;
         stream.flush()?;
@@ -217,6 +197,7 @@ impl Server {
 }
 
 fn main() -> io::Result<()> {
-    let mut server = Server::new(8080)?;
+    let ports = vec![8080, 8000, 8001]; // Multiple ports
+    let mut server = Server::new(&ports)?;
     server.run()
 }
