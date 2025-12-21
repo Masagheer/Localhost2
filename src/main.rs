@@ -10,6 +10,38 @@ use libc::{
 const MAX_EVENTS: usize = 1024;
 const TIMEOUT_MS: i32 = 1000;
 
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum StatusCode {
+    Ok = 200,
+    BadRequest = 400,
+    Forbidden = 403,
+    NotFound = 404,
+    MethodNotAllowed = 405,
+    PayloadTooLarge = 413,
+    InternalServerError = 500,
+}
+
+impl StatusCode {
+    fn to_string(&self) -> &str {
+        match self {
+            StatusCode::Ok => "200 OK",
+            StatusCode::BadRequest => "400 Bad Request",
+            StatusCode::Forbidden => "403 Forbidden",
+            StatusCode::NotFound => "404 Not Found",
+            StatusCode::MethodNotAllowed => "405 Method Not Allowed",
+            StatusCode::PayloadTooLarge => "413 Payload Too Large",
+            StatusCode::InternalServerError => "500 Internal Server Error",
+        }
+    }
+}
+
+struct HttpResponse {
+    status: StatusCode,
+    content_type: String,
+    body: String,
+}
+
 struct Connection {
     stream: TcpStream,
 }
@@ -148,7 +180,7 @@ impl Server {
     }
 
     fn handle_client_data(&mut self, fd: RawFd) -> io::Result<()> {
-        let mut should_send_response = false;
+        let mut should_send_response = None;
         let mut should_close = false;
 
         if let Some(connection) = self.connections.get_mut(&fd) {
@@ -159,16 +191,30 @@ impl Server {
                     return Err(io::Error::new(io::ErrorKind::Other, "Connection closed"));
                 }
                 Ok(n) => {
-                    if let Some((request_line, headers)) = Self::parse_http_request(&buffer, n) {
+                    if n > 4096 {
+                        should_send_response = Some(StatusCode::PayloadTooLarge);
+                    } else if let Some((request_line, headers)) = Self::parse_http_request(&buffer, n) {
                         println!("Request line: {}", request_line);
                         println!("Headers: {:?}", headers);
 
-                        // Check if client wants to close connection
+                        // Parse the request method
+                        let parts: Vec<&str> = request_line.split_whitespace().collect();
+                        if parts.len() != 3 {
+                            should_send_response = Some(StatusCode::BadRequest);
+                        } else {
+                            match parts[0] {
+                                "GET" | "POST" | "DELETE" => {
+                                    should_send_response = Some(StatusCode::Ok);
+                                }
+                                _ => {
+                                    should_send_response = Some(StatusCode::MethodNotAllowed);
+                                }
+                            }
+                        }
+
                         if let Some(connection_header) = headers.get("connection") {
                             should_close = connection_header.to_lowercase() == "close";
                         }
-
-                        should_send_response = true;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -176,14 +222,23 @@ impl Server {
                 }
                 Err(e) => {
                     eprintln!("Error reading from client: {}", e);
-                    return Err(e);
+                    should_send_response = Some(StatusCode::InternalServerError);
                 }
             }
         }
 
-        if should_send_response {
+        if let Some(status) = should_send_response {
             if let Some(conn) = self.connections.get_mut(&fd) {
-                Self::send_response(&mut conn.stream)?;
+                let response = if status == StatusCode::Ok {
+                    HttpResponse {
+                        status,
+                        content_type: "text/html; charset=utf-8".to_string(),
+                        body: "<html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>".to_string(),
+                    }
+                } else {
+                    Self::create_error_page(status)
+                };
+                Self::send_response(&mut conn.stream, response)?;
             }
         }
 
@@ -220,24 +275,58 @@ impl Server {
         None
     }
     
-    fn send_response(stream: &mut TcpStream) -> io::Result<()> {
+    fn send_response(stream: &mut TcpStream, response: HttpResponse) -> io::Result<()> {
         let current_time = chrono::Utc::now();
         let date = current_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
-        let html = "<html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>";
-        let content_length = html.len();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
+        
+        let response_string = format!(
+            "HTTP/1.1 {}\r\n\
             Server: RustServer/1.0\r\n\
             Date: {}\r\n\
-            Content-Type: text/html; charset=utf-8\r\n\
+            Content-Type: {}\r\n\
             Content-Length: {}\r\n\
             Connection: keep-alive\r\n\
             \r\n\
-            {}", date, content_length, html);
+            {}",
+            response.status.to_string(),
+            date,
+            response.content_type,
+            response.body.len(),
+            response.body
+        );
         
-        stream.write_all(response.as_bytes())?;
+        stream.write_all(response_string.as_bytes())?;
         stream.flush()?;
         Ok(())
+    }
+
+    fn create_error_page(status: StatusCode) -> HttpResponse {
+        let body = format!(
+            "<html>\
+            <head><title>Error {}</title></head>\
+            <body>\
+            <h1>{}</h1>\
+            <p>{}</p>\
+            </body>\
+            </html>",
+            status as i32,
+            status.to_string(),
+            match status {
+                StatusCode::BadRequest => "The request could not be understood by the server.",
+                StatusCode::Forbidden => "You don't have permission to access this resource.",
+                StatusCode::NotFound => "The requested resource could not be found.",
+                StatusCode::MethodNotAllowed => "The requested method is not allowed for this resource.",
+                StatusCode::PayloadTooLarge => "The request payload is too large.",
+                StatusCode::InternalServerError => "An internal server error occurred.",
+                _ => "",
+            }
+        );
+
+        HttpResponse {
+            status,
+            content_type: "text/html; charset=utf-8".to_string(),
+            body,
+        }
     }
 }
 

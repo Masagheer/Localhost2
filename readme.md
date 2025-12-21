@@ -14,4 +14,5 @@ Correct elements:
 ✅ Connection: Set to keep-alive for HTTP/1.1 persistent connections
 ✅ Server header: Identifies your server
 
+Added error pages
 
