@@ -148,7 +148,10 @@ impl Server {
     }
 
     fn handle_client_data(&mut self, fd: RawFd) -> io::Result<()> {
-        let should_send_response = if let Some(connection) = self.connections.get_mut(&fd) {
+        let mut should_send_response = false;
+        let mut should_close = false;
+
+        if let Some(connection) = self.connections.get_mut(&fd) {
             let mut buffer = [0; 4096];
             match connection.stream.read(&mut buffer) {
                 Ok(0) => {
@@ -156,11 +159,16 @@ impl Server {
                     return Err(io::Error::new(io::ErrorKind::Other, "Connection closed"));
                 }
                 Ok(n) => {
-                    if let Ok(request) = String::from_utf8(buffer[..n].to_vec()) {
-                        println!("Received request:\n{}", request);
-                        true
-                    } else {
-                        false
+                    if let Some((request_line, headers)) = Self::parse_http_request(&buffer, n) {
+                        println!("Request line: {}", request_line);
+                        println!("Headers: {:?}", headers);
+
+                        // Check if client wants to close connection
+                        if let Some(connection_header) = headers.get("connection") {
+                            should_close = connection_header.to_lowercase() == "close";
+                        }
+
+                        should_send_response = true;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -171,24 +179,61 @@ impl Server {
                     return Err(e);
                 }
             }
-        } else {
-            return Ok(());
-        };
+        }
 
         if should_send_response {
             if let Some(conn) = self.connections.get_mut(&fd) {
                 Self::send_response(&mut conn.stream)?;
             }
         }
+
+        if should_close {
+            return Err(io::Error::new(io::ErrorKind::Other, "Client requested close"));
+        }
+
         Ok(())
+    }
+
+    fn parse_http_request(buffer: &[u8], size: usize) -> Option<(String, HashMap<String, String>)>{
+        if let Ok(request_str) = String::from_utf8(buffer[..size].to_vec()){
+            let lines: Vec<&str> = request_str.split("\r\n").collect();
+            if lines.is_empty(){
+                return None;
+            }
+
+            // Parse request line
+            let request_line = lines[0];
+
+            // Parse headers
+            let mut headers = HashMap::new();
+            for line in lines.iter().skip(1){
+                if line.is_empty(){
+                    break;
+                }
+                if let Some((key, value)) = line.split_once(": "){
+                    headers.insert(key.to_lowercase(), value.to_string());
+                };
+            }
+
+            return Some((request_line.to_string(), headers))
+        }
+        None
     }
     
     fn send_response(stream: &mut TcpStream) -> io::Result<()> {
-        let response = "HTTP/1.1 200 OK\r\n\
-                       Content-Type: text/html\r\n\
-                       Content-Length: 82\r\n\
-                       \r\n\
-                       <html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>";
+        let current_time = chrono::Utc::now();
+        let date = current_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let html = "<html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>";
+        let content_length = html.len();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+            Server: RustServer/1.0\r\n\
+            Date: {}\r\n\
+            Content-Type: text/html; charset=utf-8\r\n\
+            Content-Length: {}\r\n\
+            Connection: keep-alive\r\n\
+            \r\n\
+            {}", date, content_length, html);
         
         stream.write_all(response.as_bytes())?;
         stream.flush()?;
