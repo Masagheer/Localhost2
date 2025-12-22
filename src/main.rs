@@ -6,9 +6,11 @@ use libc::{
     epoll_create1, epoll_ctl, epoll_wait, epoll_event,
     EPOLLIN, EPOLLERR, EPOLLHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL,
 };
+use std::time::{Instant, Duration};
 
 const MAX_EVENTS: usize = 1024;
 const TIMEOUT_MS: i32 = 1000;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // 30 seconds timeout
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -44,6 +46,7 @@ struct HttpResponse {
 
 struct Connection {
     stream: TcpStream,
+    last_activity: Instant,
 }
 
 struct Server {
@@ -99,6 +102,9 @@ impl Server {
         let mut events = vec![epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
         
         loop {
+            // Check for timeouts before waiting for events
+            self.check_timeouts()?;
+
             let num_events = unsafe {
                 epoll_wait(
                     self.epoll_fd,
@@ -115,7 +121,6 @@ impl Server {
             for i in 0..num_events as usize {
                 let fd = events[i].u64 as RawFd;
 
-                // Check if this fd belongs to any of our listeners
                 if self.listeners.iter().any(|l| l.as_raw_fd() == fd) {
                     self.accept_connection(fd)?;
                 } else {
@@ -135,7 +140,6 @@ impl Server {
     }
 
     fn accept_connection(&mut self, listener_fd: RawFd) -> io::Result<()> {
-        // Find the correct listener
         let listener = self.listeners.iter()
             .find(|l| l.as_raw_fd() == listener_fd)
             .unwrap();
@@ -162,7 +166,10 @@ impl Server {
                     }
                 }
 
-                self.connections.insert(fd, Connection { stream });
+                self.connections.insert(fd, Connection { 
+                    stream,
+                    last_activity: Instant::now(),
+                });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => eprintln!("Error accepting connection: {}", e),
@@ -170,7 +177,6 @@ impl Server {
         Ok(())
     }
 
-    // ... rest of the implementation remains the same ...
     fn remove_connection(&mut self, fd: RawFd) -> io::Result<()> {
         unsafe {
             epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, std::ptr::null_mut());
@@ -180,6 +186,11 @@ impl Server {
     }
 
     fn handle_client_data(&mut self, fd: RawFd) -> io::Result<()> {
+        // Update last activity time when handling data
+        if let Some(conn) = self.connections.get_mut(&fd) {
+            conn.last_activity = Instant::now();
+        }
+        
         let mut should_send_response = None;
         let mut should_close = false;
 
@@ -327,6 +338,35 @@ impl Server {
             content_type: "text/html; charset=utf-8".to_string(),
             body,
         }
+    }
+
+    fn check_timeouts(&mut self) -> io::Result<()> {
+        let now = Instant::now();
+        let mut timed_out_fds = Vec::new();
+
+        // Collect FDs of timed out connections
+        for (&fd, conn) in self.connections.iter() {
+            if now.duration_since(conn.last_activity) > REQUEST_TIMEOUT {
+                timed_out_fds.push(fd);
+            }
+        }
+
+        // Remove timed out connections
+        for fd in timed_out_fds {
+            println!("Connection timed out, closing...");
+            if let Some(conn) = self.connections.get_mut(&fd) {
+                // Send timeout response before closing
+                let response = HttpResponse {
+                    status: StatusCode::InternalServerError,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    body: "<html><body><h1>408 Request Timeout</h1><p>The request has timed out.</p></body></html>".to_string(),
+                };
+                let _ = Self::send_response(&mut conn.stream, response);
+            }
+            self.remove_connection(fd)?;
+        }
+
+        Ok(())
     }
 }
 
