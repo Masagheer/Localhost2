@@ -1,16 +1,20 @@
 use std::net::{TcpListener, TcpStream};
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd}; 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use libc::{
     epoll_create1, epoll_ctl, epoll_wait, epoll_event,
     EPOLLIN, EPOLLERR, EPOLLHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL,
 };
-use std::time::{Instant, Duration};
+use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_EVENTS: usize = 1024;
 const TIMEOUT_MS: i32 = 1000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // 30 seconds timeout
+// Add these new structs and constants
+const SESSION_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
+const COOKIE_NAME: &str = "RUSTSESSIONID";
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -42,6 +46,7 @@ struct HttpResponse {
     status: StatusCode,
     content_type: String,
     body: String,
+    headers: HashMap<String, String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -85,10 +90,74 @@ impl Connection {
     }
 }
 
+#[derive(Clone)]
+#[allow(dead_code)]
+struct Session {
+    id: String,
+    data: HashMap<String, String>,
+    last_accessed: Instant,
+}
+
+impl Session {
+    fn new(id: String) -> Self {
+        Session {
+            id,
+            data: HashMap::new(),
+            last_accessed: Instant::now(),
+        }
+    }
+
+    fn update_access_time(&mut self) {
+        self.last_accessed = Instant::now();
+    }
+}
+
+struct SessionManager {
+    sessions: HashMap<String, Session>,
+}
+
+impl SessionManager {
+    fn new() -> Self {
+        SessionManager {
+            sessions: HashMap::new(),
+        }
+    }
+
+    fn create_session(&mut self) -> String {
+        let mut hasher = DefaultHasher::new();
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .hash(&mut hasher);
+        let session_id = format!("{:x}", hasher.finish());
+        
+        self.sessions.insert(session_id.clone(), Session::new(session_id.clone()));
+        session_id
+    }
+
+    fn get_session(&mut self, session_id: &str) -> Option<&mut Session> {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.update_access_time();
+            Some(session)
+        } else {
+            None
+        }
+    }
+
+    fn cleanup_expired_sessions(&mut self) {
+        let now = Instant::now();
+        self.sessions.retain(|_, session| {
+            now.duration_since(session.last_accessed) < SESSION_TIMEOUT
+        });
+    }
+}
+
 struct Server {
     listeners: Vec<TcpListener>,
     epoll_fd: RawFd,
     connections: HashMap<RawFd, Connection>,
+    session_manager: SessionManager,
 }
 
 impl Server {
@@ -126,11 +195,12 @@ impl Server {
             println!("Server listening on http://localhost:{}/", port);
             listeners.push(listener);
         }
-        
+
         Ok(Server {
             listeners,
             epoll_fd,
             connections: HashMap::new(),
+            session_manager: SessionManager::new(),
         })
     }
     
@@ -276,41 +346,106 @@ impl Server {
         }
     }
 
-    fn handle_request(&self, request: HttpRequest) -> HttpResponse {
-        match request.method {
-            HttpMethod::GET => self.handle_get(request),
-            HttpMethod::POST => self.handle_post(request),
-            HttpMethod::DELETE => self.handle_delete(request),
+    fn handle_request(&mut self, request: HttpRequest) -> HttpResponse {
+        // Parse cookies from request
+        let cookies = Self::parse_cookies(&request.headers);
+        let session_id = cookies.get(COOKIE_NAME);
+
+        // Get or create session
+        let session_id = match session_id {
+            Some(id) => {
+                if self.session_manager.get_session(id).is_some() {
+                    id.clone()
+                } else {
+                    self.session_manager.create_session()
+                }
+            }
+            None => self.session_manager.create_session(),
+        };
+
+        // Clean up expired sessions periodically
+        self.session_manager.cleanup_expired_sessions();
+
+        // Get session for request handling
+        let session = self.session_manager.get_session(&session_id).unwrap();
+
+        // Handle the request based on method
+        let mut response = match request.method {
+            HttpMethod::GET => Self::handle_get(&request, session),
+            HttpMethod::POST => Self::handle_post(&request, session),
+            HttpMethod::DELETE => Self::handle_delete(&request, session),
             HttpMethod::UNSUPPORTED => HttpResponse {
                 status: StatusCode::MethodNotAllowed,
                 content_type: "text/html; charset=utf-8".to_string(),
                 body: "<html><body><h1>405 Method Not Allowed</h1></body></html>".to_string(),
+                headers: HashMap::new(),
             },
-        }
+        };
+
+        // Add session cookie to response
+        response.headers.insert(
+            "Set-Cookie".to_string(),
+            format!("{}={}; Path=/; HttpOnly", COOKIE_NAME, session_id)
+        );
+
+        response
     }
 
-    fn handle_get(&self, request: HttpRequest) -> HttpResponse {
+    fn parse_cookies(headers: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut cookies = HashMap::new();
+        if let Some(cookie_header) = headers.get("cookie") {
+            for cookie in cookie_header.split(';') {
+                let cookie = cookie.trim();
+                if let Some((key, value)) = cookie.split_once('=') {
+                    cookies.insert(key.to_string(), value.to_string());
+                }
+            }
+        }
+        cookies
+    }
+
+    fn handle_get(request: &HttpRequest, session: &mut Session) -> HttpResponse {
+        // Example of using session data
+        let visit_count = session.data
+            .entry("visit_count".to_string())
+            .or_insert("0".to_string());
+        let count = visit_count.parse::<i32>().unwrap_or(0) + 1;
+        session.data.insert("visit_count".to_string(), count.to_string());
+
         // Simple router based on path
         match request.path.as_str() {
-            "/" => HttpResponse {
-                status: StatusCode::Ok,
-                content_type: "text/html; charset=utf-8".to_string(),
-                body: "<html><body><h1>Welcome to Rust Server Localhost!</h1></body></html>".to_string(),
-            },
+            "/" => {
+                let body = format!(
+                    "<html><body>\
+                    <h1>Welcome to Rust Server!</h1>\
+                    <p>You have visited this page {} times.</p>\
+                    </body></html>",
+                    count
+                );
+
+                HttpResponse {
+                    status: StatusCode::Ok,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    body,
+                    headers: HashMap::new(),
+                }
+            }
             "/about" => HttpResponse {
                 status: StatusCode::Ok,
                 content_type: "text/html; charset=utf-8".to_string(),
                 body: "<html><body><h1>About Page</h1></body></html>".to_string(),
+                headers: HashMap::new(),
             },
             _ => HttpResponse {
                 status: StatusCode::NotFound,
                 content_type: "text/html; charset=utf-8".to_string(),
                 body: "<html><body><h1>404 Not Found</h1></body></html>".to_string(),
+                headers: HashMap::new(),
             },
         }
     }
 
-    fn handle_post(&self, request: HttpRequest) -> HttpResponse {
+    fn handle_post(request: &HttpRequest, _session: &mut Session) -> HttpResponse {
         // Handle POST request
         // For now, just echo back the received data
         let response_body = format!(
@@ -327,10 +462,11 @@ impl Server {
             status: StatusCode::Ok,
             content_type: "text/html; charset=utf-8".to_string(),
             body: response_body,
+            headers: HashMap::new(),
         }
     }
 
-    fn handle_delete(&self, request: HttpRequest) -> HttpResponse {
+    fn handle_delete(request: &HttpRequest, _session: &mut Session) -> HttpResponse {
         // Handle DELETE request
         // For now, just acknowledge the deletion request
         let response_body = format!(
@@ -345,6 +481,7 @@ impl Server {
             status: StatusCode::Ok,
             content_type: "text/html; charset=utf-8".to_string(),
             body: response_body,
+            headers: HashMap::new(),
         }
     }
 
@@ -370,6 +507,7 @@ impl Server {
                             status: StatusCode::BadRequest,
                             content_type: "text/html; charset=utf-8".to_string(),
                             body: "<html><body><h1>400 Bad Request</h1></body></html>".to_string(),
+                            headers: HashMap::new(),
                         });
                     }
                 }
@@ -458,6 +596,7 @@ impl Server {
             status: StatusCode::Ok,
             content_type: "text/html; charset=utf-8".to_string(),
             body: "<html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>".to_string(),
+            headers: HashMap::new(),
         })
     }
     
@@ -492,21 +631,27 @@ impl Server {
         let current_time = chrono::Utc::now();
         let date = current_time.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         
-        let response_string = format!(
+        // Start with status line and basic headers
+        let mut response_string = format!(
             "HTTP/1.1 {}\r\n\
             Server: RustServer/1.0\r\n\
             Date: {}\r\n\
             Content-Type: {}\r\n\
-            Content-Length: {}\r\n\
-            Connection: keep-alive\r\n\
-            \r\n\
-            {}",
+            Content-Length: {}\r\n",
             response.status.to_string(),
             date,
             response.content_type,
             response.body.len(),
-            response.body
         );
+
+        // Add custom headers
+        for (key, value) in response.headers {
+            response_string.push_str(&format!("{}: {}\r\n", key, value));
+        }
+
+        // Add blank line and body
+        response_string.push_str("\r\n");
+        response_string.push_str(&response.body);
         
         stream.write_all(response_string.as_bytes())?;
         stream.flush()?;
@@ -540,6 +685,7 @@ impl Server {
             status,
             content_type: "text/html; charset=utf-8".to_string(),
             body,
+            headers: HashMap::new(),
         }
     }
 
@@ -563,6 +709,7 @@ impl Server {
                     status: StatusCode::InternalServerError,
                     content_type: "text/html; charset=utf-8".to_string(),
                     body: "<html><body><h1>408 Request Timeout</h1><p>The request has timed out.</p></body></html>".to_string(),
+                    headers: HashMap::new(),
                 };
                 let _ = Self::send_response(&mut conn.stream, response);
             }
