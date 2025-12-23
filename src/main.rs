@@ -44,9 +44,27 @@ struct HttpResponse {
     body: String,
 }
 
+// Add these new fields to track request state
 struct Connection {
     stream: TcpStream,
     last_activity: Instant,
+    buffer: Vec<u8>,
+    chunked: bool,
+    content_length: Option<usize>,
+    request_complete: bool,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> Self {
+        Connection {
+            stream,
+            last_activity: Instant::now(),
+            buffer: Vec::new(),
+            chunked: false,
+            content_length: None,
+            request_complete: false,
+        }
+    }
 }
 
 struct Server {
@@ -166,10 +184,12 @@ impl Server {
                     }
                 }
 
-                self.connections.insert(fd, Connection { 
-                    stream,
-                    last_activity: Instant::now(),
-                });
+                self.connections.insert(fd, Connection::new(stream));
+
+                // self.connections.insert(fd, Connection { 
+                //     stream,
+                //     last_activity: Instant::now(),
+                // });
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => eprintln!("Error accepting connection: {}", e),
@@ -186,46 +206,57 @@ impl Server {
     }
 
     fn handle_client_data(&mut self, fd: RawFd) -> io::Result<()> {
-        // Update last activity time when handling data
-        if let Some(conn) = self.connections.get_mut(&fd) {
-            conn.last_activity = Instant::now();
-        }
+        let mut temp_buffer = [0; 4096];
         
-        let mut should_send_response = None;
-        let mut should_close = false;
-
         if let Some(connection) = self.connections.get_mut(&fd) {
-            let mut buffer = [0; 4096];
-            match connection.stream.read(&mut buffer) {
+            connection.last_activity = Instant::now();
+
+            match connection.stream.read(&mut temp_buffer) {
                 Ok(0) => {
                     println!("Connection closed by client");
                     return Err(io::Error::new(io::ErrorKind::Other, "Connection closed"));
                 }
                 Ok(n) => {
-                    if n > 4096 {
-                        should_send_response = Some(StatusCode::PayloadTooLarge);
-                    } else if let Some((request_line, headers)) = Self::parse_http_request(&buffer, n) {
-                        println!("Request line: {}", request_line);
-                        println!("Headers: {:?}", headers);
-
-                        // Parse the request method
-                        let parts: Vec<&str> = request_line.split_whitespace().collect();
-                        if parts.len() != 3 {
-                            should_send_response = Some(StatusCode::BadRequest);
-                        } else {
-                            match parts[0] {
-                                "GET" | "POST" | "DELETE" => {
-                                    should_send_response = Some(StatusCode::Ok);
+                    connection.buffer.extend_from_slice(&temp_buffer[..n]);
+                    
+                    if !connection.request_complete {
+                        if let Some((headers_end, headers)) = Self::parse_headers(&connection.buffer) {
+                            // First time processing headers
+                            if connection.content_length.is_none() && !connection.chunked {
+                                // Check transfer encoding
+                                if let Some(encoding) = headers.get("transfer-encoding") {
+                                    connection.chunked = encoding.to_lowercase().contains("chunked");
                                 }
-                                _ => {
-                                    should_send_response = Some(StatusCode::MethodNotAllowed);
+                                
+                                // Check content length
+                                if let Some(length) = headers.get("content-length") {
+                                    if let Ok(len) = length.parse::<usize>() {
+                                        connection.content_length = Some(len);
+                                    }
                                 }
                             }
-                        }
 
-                        if let Some(connection_header) = headers.get("connection") {
-                            should_close = connection_header.to_lowercase() == "close";
+                            if connection.chunked {
+                                connection.request_complete = Self::process_chunked_request(&connection.buffer[headers_end..]);
+                            } else if let Some(content_length) = connection.content_length {
+                                connection.request_complete = connection.buffer.len() >= headers_end + content_length;
+                            } else {
+                                // No body expected
+                                connection.request_complete = true;
+                            }
                         }
+                    }
+
+                    if connection.request_complete {
+                        // Process the complete request
+                        let response = Self::process_request(&connection.buffer)?;
+                        Self::send_response(&mut connection.stream, response)?;
+                        
+                        // Reset connection state for next request
+                        connection.buffer.clear();
+                        connection.chunked = false;
+                        connection.content_length = None;
+                        connection.request_complete = false;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -233,33 +264,79 @@ impl Server {
                 }
                 Err(e) => {
                     eprintln!("Error reading from client: {}", e);
-                    should_send_response = Some(StatusCode::InternalServerError);
+                    return Err(e);
                 }
             }
         }
-
-        if let Some(status) = should_send_response {
-            if let Some(conn) = self.connections.get_mut(&fd) {
-                let response = if status == StatusCode::Ok {
-                    HttpResponse {
-                        status,
-                        content_type: "text/html; charset=utf-8".to_string(),
-                        body: "<html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>".to_string(),
-                    }
-                } else {
-                    Self::create_error_page(status)
-                };
-                Self::send_response(&mut conn.stream, response)?;
-            }
-        }
-
-        if should_close {
-            return Err(io::Error::new(io::ErrorKind::Other, "Client requested close"));
-        }
-
         Ok(())
     }
 
+    fn parse_headers(buffer: &[u8]) -> Option<(usize, HashMap<String, String>)> {
+        if let Ok(data) = String::from_utf8(buffer.to_vec()) {
+            if let Some(headers_end) = data.find("\r\n\r\n") {
+                let headers_str = &data[..headers_end];
+                let mut headers = HashMap::new();
+                
+                for line in headers_str.split("\r\n").skip(1) {
+                    if let Some((key, value)) = line.split_once(": ") {
+                        headers.insert(key.to_lowercase(), value.to_string());
+                    }
+                }
+                
+                return Some((headers_end + 4, headers));
+            }
+        }
+        None
+    }
+
+    fn process_chunked_request(data: &[u8]) -> bool {
+        if let Ok(data_str) = String::from_utf8(data.to_vec()) {
+            let mut pos = 0;
+            let mut found_end = false;
+
+            while pos < data_str.len() {
+                // Find chunk size line
+                if let Some(size_end) = data_str[pos..].find("\r\n") {
+                    // Parse chunk size (hex)
+                    if let Ok(chunk_size) = usize::from_str_radix(data_str[pos..pos+size_end].trim(), 16) {
+                        if chunk_size == 0 {
+                            found_end = true;
+                            break;
+                        }
+                        
+                        // Skip chunk data and CRLF
+                        pos += size_end + 2 + chunk_size + 2;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            
+            return found_end;
+        }
+        false
+    }
+
+    fn process_request(buffer: &[u8]) -> io::Result<HttpResponse> {
+        // Process the complete request (either chunked or regular)
+        if let Ok(request_str) = String::from_utf8(buffer.to_vec()) {
+            let lines: Vec<&str> = request_str.split("\r\n").collect();
+            if !lines.is_empty() {
+                println!("Processing complete request");
+                println!("Request line: {}", lines[0]);
+            }
+        }
+        
+        Ok(HttpResponse {
+            status: StatusCode::Ok,
+            content_type: "text/html; charset=utf-8".to_string(),
+            body: "<html><body><h1>Hello from Rust Server!</h1><p>Your request was received.</p></body></html>".to_string(),
+        })
+    }
+    
+    #[allow(dead_code)]
     fn parse_http_request(buffer: &[u8], size: usize) -> Option<(String, HashMap<String, String>)>{
         if let Ok(request_str) = String::from_utf8(buffer[..size].to_vec()){
             let lines: Vec<&str> = request_str.split("\r\n").collect();
@@ -311,6 +388,7 @@ impl Server {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn create_error_page(status: StatusCode) -> HttpResponse {
         let body = format!(
             "<html>\
