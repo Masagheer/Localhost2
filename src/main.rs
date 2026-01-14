@@ -8,6 +8,8 @@ use libc::{
     EPOLLIN, EPOLLERR, EPOLLHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL,
 };
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
+use std::fs::{File, create_dir_all};
+use std::path::Path;
 
 const MAX_EVENTS: usize = 1024;
 const TIMEOUT_MS: i32 = 1000;
@@ -294,56 +296,42 @@ impl Server {
     }
 
     fn parse_request(buffer: &[u8]) -> Option<HttpRequest> {
-        if let Ok(request_str) = String::from_utf8(buffer.to_vec()) {
-            let lines: Vec<&str> = request_str.split("\r\n").collect();
-            if lines.is_empty() {
-                return None;
-            }
+        // Find end of headers (\r\n\r\n) in the raw buffer to preserve binary body
+        let sep = b"\r\n\r\n";
+        if let Some(idx) = buffer.windows(sep.len()).position(|w| w == sep) {
+            // Parse request line and headers as UTF-8 (headers are ASCII/UTF-8)
+            if let Ok(head_str) = String::from_utf8(buffer[..idx].to_vec()) {
+                let mut lines = head_str.split("\r\n");
+                let request_line = lines.next()?;
 
-            // Parse request line
-            let request_parts: Vec<&str> = lines[0].split_whitespace().collect();
-            if request_parts.len() != 3 {
-                return None;
-            }
-
-            let method = match request_parts[0] {
-                "GET" => HttpMethod::GET,
-                "POST" => HttpMethod::POST,
-                "DELETE" => HttpMethod::DELETE,
-                _ => HttpMethod::UNSUPPORTED,
-            };
-
-            let path = request_parts[1].to_string();
-
-            // Parse headers
-            let mut headers = HashMap::new();
-            let mut body_start = 0;
-            for (i, line) in lines.iter().enumerate().skip(1) {
-                if line.is_empty() {
-                    body_start = i + 1;
-                    break;
+                let request_parts: Vec<&str> = request_line.split_whitespace().collect();
+                if request_parts.len() != 3 {
+                    return None;
                 }
-                if let Some((key, value)) = line.split_once(": ") {
-                    headers.insert(key.to_lowercase(), value.to_string());
+
+                let method = match request_parts[0] {
+                    "GET" => HttpMethod::GET,
+                    "POST" => HttpMethod::POST,
+                    "DELETE" => HttpMethod::DELETE,
+                    _ => HttpMethod::UNSUPPORTED,
+                };
+
+                let path = request_parts[1].to_string();
+
+                let mut headers = HashMap::new();
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(": ") {
+                        headers.insert(k.to_lowercase(), v.to_string());
+                    }
                 }
+
+                // Body starts after the header separator
+                let body = buffer[idx + sep.len()..].to_vec();
+
+                return Some(HttpRequest { method, path, headers, body });
             }
-
-            // Get body
-            let body = if body_start < lines.len() {
-                lines[body_start..].join("\r\n").into_bytes()
-            } else {
-                Vec::new()
-            };
-
-            Some(HttpRequest {
-                method,
-                path,
-                headers,
-                body,
-            })
-        } else {
-            None
         }
+        None
     }
 
     fn handle_request(&mut self, request: HttpRequest) -> HttpResponse {
@@ -436,6 +424,52 @@ impl Server {
                 body: "<html><body><h1>About Page</h1></body></html>".to_string(),
                 headers: HashMap::new(),
             },
+            "/upload" => {
+                let body = "<html><body>\
+                            <h1>Upload a file</h1>\
+                            <form action=\"/upload\" method=\"post\" enctype=\"multipart/form-data\">\
+                            <input type=\"file\" name=\"file\" />\
+                            <input type=\"submit\" value=\"Upload\" />\
+                            </form>\
+                            </body></html>".to_string();
+
+                HttpResponse {
+                    status: StatusCode::Ok,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    body,
+                    headers: HashMap::new(),
+                }
+            }
+            p if p.starts_with("/uploads/") => {
+                // Serve files saved in the uploads/ directory (text files like HTML/CSS/JS)
+                let rel = &p["/uploads/".len()..];
+                let path = Path::new("uploads").join(rel);
+
+                if path.exists() && path.is_file() {
+                    match std::fs::read_to_string(&path) {
+                        Ok(contents) => {
+                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                            let content_type = match ext.as_str() {
+                                "html" | "htm" => "text/html; charset=utf-8",
+                                "css" => "text/css; charset=utf-8",
+                                "js" => "application/javascript; charset=utf-8",
+                                "json" => "application/json; charset=utf-8",
+                                _ => "text/plain; charset=utf-8",
+                            };
+
+                            return HttpResponse {
+                                status: StatusCode::Ok,
+                                content_type: content_type.to_string(),
+                                body: contents,
+                                headers: HashMap::new(),
+                            };
+                        }
+                        Err(_) => return Self::create_error_page(StatusCode::NotFound),
+                    }
+                } else {
+                    return Self::create_error_page(StatusCode::NotFound);
+                }
+            }
             _ => HttpResponse {
                 status: StatusCode::NotFound,
                 content_type: "text/html; charset=utf-8".to_string(),
@@ -446,8 +480,37 @@ impl Server {
     }
 
     fn handle_post(request: &HttpRequest, _session: &mut Session) -> HttpResponse {
-        // Handle POST request
-        // For now, just echo back the received data
+        // Handle POST request - support multipart/form-data file uploads
+        if let Some(content_type) = request.headers.get("content-type") {
+            if content_type.starts_with("multipart/form-data") {
+                match Self::save_multipart_files(&request.body, content_type) {
+                    Ok(files) => {
+                        let mut body = String::from("<html><body><h1>Upload Successful</h1><ul>");
+                        for f in files {
+                            body.push_str(&format!("<li><a href=\"/uploads/{}\">{}</a></li>", f, f));
+                        }
+                        body.push_str("</ul></body></html>");
+
+                        return HttpResponse {
+                            status: StatusCode::Ok,
+                            content_type: "text/html; charset=utf-8".to_string(),
+                            body,
+                            headers: HashMap::new(),
+                        };
+                    }
+                    Err(e) => {
+                        return HttpResponse {
+                            status: StatusCode::InternalServerError,
+                            content_type: "text/html; charset=utf-8".to_string(),
+                            body: format!("<html><body><h1>500</h1><p>Error saving upload: {}</p></body></html>", e),
+                            headers: HashMap::new(),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Fallback: echo back the received data length
         let response_body = format!(
             "<html><body>\
             <h1>POST Request Received</h1>\
@@ -464,6 +527,99 @@ impl Server {
             body: response_body,
             headers: HashMap::new(),
         }
+    }
+
+    fn save_multipart_files(body: &[u8], content_type: &str) -> io::Result<Vec<String>> {
+        // Extract boundary
+        let boundary = content_type
+            .split(';')
+            .find_map(|s| {
+                let s = s.trim();
+                if s.starts_with("boundary=") {
+                    Some(s.trim_start_matches("boundary=").trim_matches('"').to_string())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "No boundary in content-type"))?;
+
+        let marker = format!("--{}", boundary).into_bytes();
+        let mut positions = Vec::new();
+        let mut i = 0usize;
+        while i + marker.len() <= body.len() {
+            if &body[i..i + marker.len()] == marker.as_slice() {
+                positions.push(i);
+                i += marker.len();
+            } else {
+                i += 1;
+            }
+        }
+
+        if positions.len() < 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "No multipart parts found"));
+        }
+
+        // Ensure uploads directory
+        let upload_dir = Path::new("uploads");
+        if !upload_dir.exists() {
+            create_dir_all(upload_dir)?;
+        }
+
+        let mut saved = Vec::new();
+
+        for part_index in 0..positions.len() - 1 {
+            let start = positions[part_index] + marker.len();
+            // Trim leading CRLF if present
+            let mut part_start = start;
+            if part_start + 2 <= body.len() && &body[part_start..part_start + 2] == b"\r\n" {
+                part_start += 2;
+            }
+            let end = positions[part_index + 1];
+            let mut part = &body[part_start..end];
+
+            // If this is the final boundary with --, break
+            if part.starts_with(b"--") {
+                break;
+            }
+
+            // Find headers/body separator in part
+            if let Some(hsep_pos) = part.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers_bytes = &part[..hsep_pos];
+                let mut filename: Option<String> = None;
+
+                if let Ok(headers_str) = String::from_utf8(headers_bytes.to_vec()) {
+                    for line in headers_str.split("\r\n") {
+                        if line.to_lowercase().starts_with("content-disposition:") {
+                            // look for filename="..."
+                            if let Some(idx) = line.find("filename=") {
+                                let fname = line[idx + 9..].trim();
+                                let fname = fname.trim_matches('"').trim_matches(' ');
+                                if !fname.is_empty() {
+                                    filename = Some(fname.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut file_data = part[hsep_pos + 4..].to_vec();
+                // Trim trailing CRLF if present
+                if file_data.ends_with(b"\r\n") {
+                    file_data.truncate(file_data.len() - 2);
+                }
+
+                if let Some(fname) = filename {
+                    let safe_name = fname.replace("..", "_");
+                    let path = upload_dir.join(&safe_name);
+                    let mut f = File::create(&path)?;
+                    use std::io::Write as IoWrite;
+                    f.write_all(&file_data)?;
+                    saved.push(safe_name);
+                }
+            }
+        }
+
+        Ok(saved)
     }
 
     fn handle_delete(request: &HttpRequest, _session: &mut Session) -> HttpResponse {
