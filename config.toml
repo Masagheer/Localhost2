@@ -1,0 +1,93 @@
+# Global defaults
+[global]
+# Maximum allowed client body size in bytes (for uploads)
+client_max_body_size = 10485760 # 10 MiB
+
+# Directory that contains custom error pages. Paths referenced below are
+# relative to this directory (e.g. errors/404.html)
+error_pages = "errors"
+
+## Server blocks
+## Each [[servers]] table defines one virtual server. If an incoming
+## request's Host / server_name doesn't match any server_name, the very
+## first matching host:port entry will act as the default.
+
+[[servers]]
+server_name = "default"
+server_address = "0.0.0.0"
+ports = [8080, 8000, 8001]
+
+## Optional per-server overrides
+[servers.settings]
+# Override global max body size for this server (bytes)
+client_max_body_size = 20971520 # 20 MiB
+
+## Routes for the server. Order isn't important. Routes do not use regex;
+## they match by exact prefix or exact path depending on your server logic.
+
+  [[servers.routes]]
+  # URL path prefix for this route
+  path = "/"
+
+  # Allowed HTTP methods for this route
+  methods = ["GET"]
+
+  # Serve files from this filesystem directory when requests start with
+  # `path`. Example: path = "/static" and root = "/var/www" means
+  # /static/foo.html -> /var/www/foo.html
+  root = "www"
+
+  # Default file to serve when a directory is requested
+  index = "index.html"
+
+  # Turn on directory listing for this route (true/false)
+  autoindex = true
+
+  # CGI handlers for this route. Each entry maps an extension to the CGI program
+  # that should be invoked to process files with that extension.
+    [[servers.routes.cgi]]
+    extension = "php"
+    command = "/usr/bin/php-cgi"
+
+  [[servers.routes.cgi]]
+  extension = "py"
+  command = "/usr/bin/python3"
+
+  # Example redirect: when the request matches this route, return a redirect
+  # instead of serving a file. `status` should be a 3xx code.
+  [[servers.routes_redirects]]
+  from = "/old-path"
+  to = "/new-path"
+  status = 302
+
+  # Note: You can omit fields you don't need; the server should use sensible
+  # defaults (e.g. allow GET, do not autoindex, no CGI).
+
+  [[servers.routes]]
+  path = "/upload"
+  methods = ["GET", "POST"]
+  # route root for uploads (files saved by the server)
+  root = "uploads"
+  index = "index.html"
+  autoindex = false
+
+[[servers]]
+server_name = "example.com"
+server_address = "0.0.0.0"
+ports = [8081]
+
+  [[servers.routes]]
+  path = "/"
+  methods = ["GET"]
+  root = "/var/www/example"
+  index = "index.html"
+  autoindex = false
+
+# Per-host default: the first servers entry containing the requested
+# host:port pair is treated as the default when no `server_name` matches.
+
+# Error pages mapping (optional). These are looked up under `error_pages` above.
+[errors]
+404 = "404.html"
+500 = "500.html"
+413 = "413.html"
