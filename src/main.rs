@@ -10,6 +10,7 @@ use libc::{
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 use std::fs::{File, create_dir_all};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 const MAX_EVENTS: usize = 1024;
 const TIMEOUT_MS: i32 = 1000;
@@ -392,7 +393,111 @@ impl Server {
         cookies
     }
 
+    fn try_run_cgi(request: &HttpRequest) -> io::Result<Option<HttpResponse>> {
+        // Only support .py CGI for now, mapped under the `www/` root
+        if request.path == "/" {
+            return Ok(None);
+        }
+
+        let rel = request.path.trim_start_matches('/');
+        let script_path = Path::new("www").join(rel);
+
+        if !script_path.exists() || !script_path.is_file() {
+            return Ok(None);
+        }
+
+        let ext = script_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if ext != "py" {
+            return Ok(None);
+        }
+
+        // Prepare command from config default: /usr/bin/python3
+        let interpreter = "/usr/bin/python3";
+
+        let mut cmd = Command::new(interpreter);
+        cmd.arg(script_path.as_os_str())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Set PATH_INFO for CGI and run in script directory for relative paths
+        if let Some(parent) = script_path.parent() {
+            cmd.current_dir(parent);
+        }
+        cmd.env("PATH_INFO", &request.path);
+
+        let mut child = cmd.spawn()?;
+
+        // Send request body (if any) to CGI stdin and then close stdin (EOF)
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as IoWrite;
+            stdin.write_all(&request.body)?;
+        }
+
+        let output = child.wait_with_output()?;
+
+        if !output.stderr.is_empty() {
+            eprintln!("CGI stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        // Try to parse headers from CGI stdout (optional)
+        let stdout = output.stdout;
+        if let Ok(stdout_str) = String::from_utf8(stdout.clone()) {
+            if let Some(pos) = stdout_str.find("\r\n\r\n") {
+                let headers_str = &stdout_str[..pos];
+                let body = stdout_str[pos + 4..].to_string();
+                let mut headers = HashMap::new();
+                let mut content_type = "text/plain; charset=utf-8".to_string();
+                for line in headers_str.split("\r\n") {
+                    if let Some((k, v)) = line.split_once(":") {
+                        let key = k.trim().to_string();
+                        let val = v.trim().to_string();
+                        if key.eq_ignore_ascii_case("content-type") {
+                            content_type = val.clone();
+                        }
+                        headers.insert(key, val);
+                    }
+                }
+
+                let status = if output.status.success() { StatusCode::Ok } else { StatusCode::InternalServerError };
+                return Ok(Some(HttpResponse { status, content_type, body, headers }));
+            } else {
+                // No headers, return raw stdout
+                let body = stdout_str;
+                let status = if output.status.success() { StatusCode::Ok } else { StatusCode::InternalServerError };
+                return Ok(Some(HttpResponse {
+                    status,
+                    content_type: "text/plain; charset=utf-8".to_string(),
+                    body,
+                    headers: HashMap::new(),
+                }));
+            }
+        }
+
+        // Fallback
+        Ok(Some(HttpResponse {
+            status: StatusCode::InternalServerError,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: String::from("CGI produced non-UTF8 output"),
+            headers: HashMap::new(),
+        }))
+    }
+
     fn handle_get(request: &HttpRequest, session: &mut Session) -> HttpResponse {
+        // Check for CGI scripts first
+        match Self::try_run_cgi(request) {
+            Ok(Some(resp)) => return resp,
+            Ok(None) => {},
+            Err(e) => {
+                eprintln!("CGI execution error: {}", e);
+                return HttpResponse {
+                    status: StatusCode::InternalServerError,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    body: format!("<html><body><h1>500</h1><p>CGI execution error: {}</p></body></html>", e),
+                    headers: HashMap::new(),
+                };
+            }
+        }
         // Example of using session data
         let visit_count = session.data
             .entry("visit_count".to_string())
@@ -480,6 +585,20 @@ impl Server {
     }
 
     fn handle_post(request: &HttpRequest, _session: &mut Session) -> HttpResponse {
+        // Check for CGI scripts first
+        match Self::try_run_cgi(request) {
+            Ok(Some(resp)) => return resp,
+            Ok(None) => {},
+            Err(e) => {
+                eprintln!("CGI execution error: {}", e);
+                return HttpResponse {
+                    status: StatusCode::InternalServerError,
+                    content_type: "text/html; charset=utf-8".to_string(),
+                    body: format!("<html><body><h1>500</h1><p>CGI execution error: {}</p></body></html>", e),
+                    headers: HashMap::new(),
+                };
+            }
+        }
         // Handle POST request - support multipart/form-data file uploads
         if let Some(content_type) = request.headers.get("content-type") {
             if content_type.starts_with("multipart/form-data") {
