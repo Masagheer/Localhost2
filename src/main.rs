@@ -237,7 +237,7 @@ impl Server {
                 for &port in ports.iter() {
                     let bind_addr = format!("{}:{}", host, port);
                     // If already bound by an earlier server, skip binding again
-                    if listeners.iter().any(|l| l.local_addr().map(|a| a.to_string()).unwrap_or_default() == bind_addr) {
+                    if listeners.iter().any(|l: &TcpListener| l.local_addr().map(|a: std::net::SocketAddr| a.to_string()).unwrap_or_default() == bind_addr) {
                         continue;
                     }
 
@@ -411,7 +411,39 @@ impl Server {
     }
 
     fn handle_request(&mut self, request: HttpRequest, server_idx: usize) -> HttpResponse {
-        // Parse cookies from request
+        // Check for CGI scripts first (before getting session to avoid borrow issues)
+        let cgi_response = match request.method {
+            HttpMethod::GET | HttpMethod::POST => {
+                match self.try_run_cgi(&request, server_idx) {
+                    Ok(Some(resp)) => Some(resp),
+                    Ok(None) => None,
+                    Err(e) => {
+                        eprintln!("CGI execution error: {}", e);
+                        Some(HttpResponse {
+                            status: StatusCode::InternalServerError,
+                            content_type: "text/html; charset=utf-8".to_string(),
+                            body: format!("<html><body><h1>500</h1><p>CGI execution error: {}</p></body></html>", e),
+                            headers: HashMap::new(),
+                        })
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(response) = cgi_response {
+            // Add session cookie to response even for CGI
+            let cookies = Self::parse_cookies(&request.headers);
+            let session_id = cookies.get(COOKIE_NAME).cloned().unwrap_or_else(|| self.session_manager.create_session());
+            let mut response = response;
+            response.headers.insert(
+                "Set-Cookie".to_string(),
+                format!("{}={}; Path=/; HttpOnly", COOKIE_NAME, session_id)
+            );
+            return response;
+        }
+
+        // Now get the session since CGI is not applicable
         let cookies = Self::parse_cookies(&request.headers);
         let session_id = cookies.get(COOKIE_NAME);
 
@@ -435,8 +467,8 @@ impl Server {
 
         // Handle the request based on method
         let mut response = match request.method {
-            HttpMethod::GET => Self::handle_get(self, &request, session, server_idx),
-            HttpMethod::POST => Self::handle_post(self, &request, session, server_idx),
+            HttpMethod::GET => Self::handle_get(&request, session),
+            HttpMethod::POST => Self::handle_post(&request, session, &self.config, server_idx),
             HttpMethod::DELETE => Self::handle_delete(&request, session),
             HttpMethod::UNSUPPORTED => HttpResponse {
                 status: StatusCode::MethodNotAllowed,
@@ -547,21 +579,7 @@ impl Server {
         Ok(None)
     }
 
-    fn handle_get(&mut self, request: &HttpRequest, session: &mut Session, server_idx: usize) -> HttpResponse {
-        // Check for CGI scripts first
-        match self.try_run_cgi(request, server_idx) {
-            Ok(Some(resp)) => return resp,
-            Ok(None) => {},
-            Err(e) => {
-                eprintln!("CGI execution error: {}", e);
-                return HttpResponse {
-                    status: StatusCode::InternalServerError,
-                    content_type: "text/html; charset=utf-8".to_string(),
-                    body: format!("<html><body><h1>500</h1><p>CGI execution error: {}</p></body></html>", e),
-                    headers: HashMap::new(),
-                };
-            }
-        }
+    fn handle_get(request: &HttpRequest, session: &mut Session) -> HttpResponse {
         // Example of using session data
         let visit_count = session.data
             .entry("visit_count".to_string())
@@ -648,27 +666,13 @@ impl Server {
         }
     }
 
-    fn handle_post(&mut self, request: &HttpRequest, _session: &mut Session, server_idx: usize) -> HttpResponse {
-        // Check for CGI scripts first
-        match self.try_run_cgi(request, server_idx) {
-            Ok(Some(resp)) => return resp,
-            Ok(None) => {},
-            Err(e) => {
-                eprintln!("CGI execution error: {}", e);
-                return HttpResponse {
-                    status: StatusCode::InternalServerError,
-                    content_type: "text/html; charset=utf-8".to_string(),
-                    body: format!("<html><body><h1>500</h1><p>CGI execution error: {}</p></body></html>", e),
-                    headers: HashMap::new(),
-                };
-            }
-        }
+    fn handle_post(request: &HttpRequest, _session: &mut Session, config: &Config, server_idx: usize) -> HttpResponse {
         // Handle POST request - support multipart/form-data file uploads
         if let Some(content_type) = request.headers.get("content-type") {
             if content_type.starts_with("multipart/form-data") {
                 // enforce client_max_body_size
-                let mut limit = self.config.global.as_ref().and_then(|g| g.client_max_body_size).unwrap_or(10 * 1024 * 1024);
-                if let Some(server) = self.config.servers.get(server_idx) {
+                let mut limit = config.global.as_ref().and_then(|g| g.client_max_body_size).unwrap_or(10 * 1024 * 1024);
+                if let Some(server) = config.servers.get(server_idx) {
                     if let Some(settings) = &server.settings {
                         if let Some(val) = settings.get("client_max_body_size") {
                             if let Some(n) = val.as_integer() { limit = n as usize; }
@@ -776,7 +780,7 @@ impl Server {
                 part_start += 2;
             }
             let end = positions[part_index + 1];
-            let mut part = &body[part_start..end];
+            let part = &body[part_start..end];
 
             // If this is the final boundary with --, break
             if part.starts_with(b"--") {
