@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd}; 
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
+use serde::Deserialize;
 use libc::{
     epoll_create1, epoll_ctl, epoll_wait, epoll_event,
     EPOLLIN, EPOLLERR, EPOLLHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL,
@@ -78,6 +79,7 @@ struct Connection {
     chunked: bool,
     content_length: Option<usize>,
     request_complete: bool,
+    server_idx: usize,
 }
 
 impl Connection {
@@ -89,6 +91,7 @@ impl Connection {
             chunked: false,
             content_length: None,
             request_complete: false,
+            server_idx: 0,
         }
     }
 }
@@ -160,50 +163,118 @@ struct Server {
     listeners: Vec<TcpListener>,
     epoll_fd: RawFd,
     connections: HashMap<RawFd, Connection>,
+    listener_map: HashMap<RawFd, usize>,
     session_manager: SessionManager,
+    config: Config,
+}
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    global: Option<GlobalConfig>,
+    #[serde(default)]
+    servers: Vec<ServerConfig>,
+    errors: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobalConfig {
+    client_max_body_size: Option<usize>,
+    error_pages: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerConfig {
+    server_name: Option<String>,
+    server_address: Option<String>,
+    ports: Option<Vec<u16>>,
+    #[serde(default)]
+    settings: Option<HashMap<String, toml::Value>>,
+    #[serde(default)]
+    routes: Vec<RouteConfig>,
+    #[serde(default)]
+    routes_redirects: Vec<RedirectConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouteConfig {
+    path: String,
+    methods: Option<Vec<String>>,
+    root: Option<String>,
+    index: Option<String>,
+    autoindex: Option<bool>,
+    #[serde(default)]
+    cgi: Vec<CgiConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CgiConfig {
+    extension: String,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedirectConfig {
+    from: String,
+    to: String,
+    status: Option<u16>,
 }
 
 impl Server {
-    pub fn new(ports: &[u16]) -> io::Result<Server> {
+    pub fn new(config: Config) -> io::Result<Server> {
         let mut listeners = Vec::new();
-        
+        let mut listener_map: HashMap<RawFd, usize> = HashMap::new();
         // Create epoll instance
         let epoll_fd = unsafe { epoll_create1(0) };
         if epoll_fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Create listeners for each port
-        for &port in ports {
-            let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-            listener.set_nonblocking(true)?;
-            
-            // Add listener to epoll
-            let mut event = epoll_event {
-                events: EPOLLIN as u32,
-                u64: listener.as_raw_fd() as u64,
-            };
+        // Create listeners for each server's ports. The first server listing a host:port
+        // wins as the default for that host:port.
+        for (sidx, server) in config.servers.iter().enumerate() {
+            let host = server.server_address.as_deref().unwrap_or("127.0.0.1");
+            if let Some(ports) = &server.ports {
+                for &port in ports.iter() {
+                    let bind_addr = format!("{}:{}", host, port);
+                    // If already bound by an earlier server, skip binding again
+                    if listeners.iter().any(|l| l.local_addr().map(|a| a.to_string()).unwrap_or_default() == bind_addr) {
+                        continue;
+                    }
 
-            unsafe {
-                if epoll_ctl(
-                    epoll_fd,
-                    EPOLL_CTL_ADD,
-                    listener.as_raw_fd(),
-                    &mut event as *mut epoll_event,
-                ) < 0 {
-                    return Err(io::Error::last_os_error());
+                    let listener = TcpListener::bind(bind_addr.clone())?;
+                    listener.set_nonblocking(true)?;
+
+                    // Add listener to epoll
+                    let mut event = epoll_event {
+                        events: EPOLLIN as u32,
+                        u64: listener.as_raw_fd() as u64,
+                    };
+
+                    unsafe {
+                        if epoll_ctl(
+                            epoll_fd,
+                            EPOLL_CTL_ADD,
+                            listener.as_raw_fd(),
+                            &mut event as *mut epoll_event,
+                        ) < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                    }
+
+                    println!("Server listening on http://{}/", bind_addr);
+                    listener_map.insert(listener.as_raw_fd(), sidx);
+                    listeners.push(listener);
                 }
             }
-            
-            println!("Server listening on http://localhost:{}/", port);
-            listeners.push(listener);
         }
 
         Ok(Server {
             listeners,
             epoll_fd,
             connections: HashMap::new(),
+            listener_map,
             session_manager: SessionManager::new(),
+            config,
         })
     }
     
@@ -275,7 +346,11 @@ impl Server {
                     }
                 }
 
-                self.connections.insert(fd, Connection::new(stream));
+                // Determine server index for this listener (default server for host:port)
+                let server_idx = *self.listener_map.get(&listener_fd).unwrap_or(&0usize);
+                let mut conn = Connection::new(stream);
+                conn.server_idx = server_idx;
+                self.connections.insert(fd, conn);
 
                 // self.connections.insert(fd, Connection { 
                 //     stream,
@@ -335,7 +410,7 @@ impl Server {
         None
     }
 
-    fn handle_request(&mut self, request: HttpRequest) -> HttpResponse {
+    fn handle_request(&mut self, request: HttpRequest, server_idx: usize) -> HttpResponse {
         // Parse cookies from request
         let cookies = Self::parse_cookies(&request.headers);
         let session_id = cookies.get(COOKIE_NAME);
@@ -360,8 +435,8 @@ impl Server {
 
         // Handle the request based on method
         let mut response = match request.method {
-            HttpMethod::GET => Self::handle_get(&request, session),
-            HttpMethod::POST => Self::handle_post(&request, session),
+            HttpMethod::GET => Self::handle_get(self, &request, session, server_idx),
+            HttpMethod::POST => Self::handle_post(self, &request, session, server_idx),
             HttpMethod::DELETE => Self::handle_delete(&request, session),
             HttpMethod::UNSUPPORTED => HttpResponse {
                 status: StatusCode::MethodNotAllowed,
@@ -393,99 +468,88 @@ impl Server {
         cookies
     }
 
-    fn try_run_cgi(request: &HttpRequest) -> io::Result<Option<HttpResponse>> {
-        // Only support .py CGI for now, mapped under the `www/` root
+    fn try_run_cgi(&self, request: &HttpRequest, server_idx: usize) -> io::Result<Option<HttpResponse>> {
+        // Attempt to locate a CGI mapping for the request under the server's routes
         if request.path == "/" {
             return Ok(None);
         }
 
-        let rel = request.path.trim_start_matches('/');
-        let script_path = Path::new("www").join(rel);
-
-        if !script_path.exists() || !script_path.is_file() {
-            return Ok(None);
-        }
-
-        let ext = script_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-        if ext != "py" {
-            return Ok(None);
-        }
-
-        // Prepare command from config default: /usr/bin/python3
-        let interpreter = "/usr/bin/python3";
-
-        let mut cmd = Command::new(interpreter);
-        cmd.arg(script_path.as_os_str())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Set PATH_INFO for CGI and run in script directory for relative paths
-        if let Some(parent) = script_path.parent() {
-            cmd.current_dir(parent);
-        }
-        cmd.env("PATH_INFO", &request.path);
-
-        let mut child = cmd.spawn()?;
-
-        // Send request body (if any) to CGI stdin and then close stdin (EOF)
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write as IoWrite;
-            stdin.write_all(&request.body)?;
-        }
-
-        let output = child.wait_with_output()?;
-
-        if !output.stderr.is_empty() {
-            eprintln!("CGI stderr: {}", String::from_utf8_lossy(&output.stderr));
-        }
-
-        // Try to parse headers from CGI stdout (optional)
-        let stdout = output.stdout;
-        if let Ok(stdout_str) = String::from_utf8(stdout.clone()) {
-            if let Some(pos) = stdout_str.find("\r\n\r\n") {
-                let headers_str = &stdout_str[..pos];
-                let body = stdout_str[pos + 4..].to_string();
-                let mut headers = HashMap::new();
-                let mut content_type = "text/plain; charset=utf-8".to_string();
-                for line in headers_str.split("\r\n") {
-                    if let Some((k, v)) = line.split_once(":") {
-                        let key = k.trim().to_string();
-                        let val = v.trim().to_string();
-                        if key.eq_ignore_ascii_case("content-type") {
-                            content_type = val.clone();
+        if let Some(server) = self.config.servers.get(server_idx) {
+            for route in server.routes.iter() {
+                if request.path.starts_with(&route.path) {
+                    if let Some(root) = &route.root {
+                        let rel = request.path.trim_start_matches(&route.path).trim_start_matches('/');
+                        let script_path = Path::new(root).join(rel);
+                        if script_path.exists() && script_path.is_file() {
+                            let ext = script_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+                            for cgi in route.cgi.iter() {
+                                if cgi.extension.to_lowercase() == ext {
+                                    // run configured CGI command
+                                    let mut parts = cgi.command.split_whitespace();
+                                    if let Some(prog) = parts.next() {
+                                        let args: Vec<&str> = parts.collect();
+                                        let mut cmd = Command::new(prog);
+                                        for a in args.iter() { cmd.arg(a); }
+                                        cmd.arg(script_path.as_os_str())
+                                            .stdin(Stdio::piped())
+                                            .stdout(Stdio::piped())
+                                            .stderr(Stdio::piped());
+                                        if let Some(parent) = script_path.parent() { cmd.current_dir(parent); }
+                                        cmd.env("PATH_INFO", &request.path);
+                                        let mut child = cmd.spawn()?;
+                                        if let Some(mut stdin) = child.stdin.take() {
+                                            use std::io::Write as IoWrite;
+                                            stdin.write_all(&request.body)?;
+                                        }
+                                        let output = child.wait_with_output()?;
+                                        if !output.stderr.is_empty() {
+                                            eprintln!("CGI stderr: {}", String::from_utf8_lossy(&output.stderr));
+                                        }
+                                        let stdout = output.stdout;
+                                        if let Ok(stdout_str) = String::from_utf8(stdout.clone()) {
+                                            if let Some(pos) = stdout_str.find("\r\n\r\n") {
+                                                let headers_str = &stdout_str[..pos];
+                                                let body = stdout_str[pos + 4..].to_string();
+                                                let mut headers = HashMap::new();
+                                                let mut content_type = "text/plain; charset=utf-8".to_string();
+                                                for line in headers_str.split("\r\n") {
+                                                    if let Some((k, v)) = line.split_once(":") {
+                                                        let key = k.trim().to_string();
+                                                        let val = v.trim().to_string();
+                                                        if key.eq_ignore_ascii_case("content-type") {
+                                                            content_type = val.clone();
+                                                        }
+                                                        headers.insert(key, val);
+                                                    }
+                                                }
+                                                let status = if output.status.success() { StatusCode::Ok } else { StatusCode::InternalServerError };
+                                                return Ok(Some(HttpResponse { status, content_type, body, headers }));
+                                            } else {
+                                                let body = stdout_str;
+                                                let status = if output.status.success() { StatusCode::Ok } else { StatusCode::InternalServerError };
+                                                return Ok(Some(HttpResponse {
+                                                    status,
+                                                    content_type: "text/plain; charset=utf-8".to_string(),
+                                                    body,
+                                                    headers: HashMap::new(),
+                                                }));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        headers.insert(key, val);
                     }
                 }
-
-                let status = if output.status.success() { StatusCode::Ok } else { StatusCode::InternalServerError };
-                return Ok(Some(HttpResponse { status, content_type, body, headers }));
-            } else {
-                // No headers, return raw stdout
-                let body = stdout_str;
-                let status = if output.status.success() { StatusCode::Ok } else { StatusCode::InternalServerError };
-                return Ok(Some(HttpResponse {
-                    status,
-                    content_type: "text/plain; charset=utf-8".to_string(),
-                    body,
-                    headers: HashMap::new(),
-                }));
             }
         }
 
-        // Fallback
-        Ok(Some(HttpResponse {
-            status: StatusCode::InternalServerError,
-            content_type: "text/plain; charset=utf-8".to_string(),
-            body: String::from("CGI produced non-UTF8 output"),
-            headers: HashMap::new(),
-        }))
+        Ok(None)
     }
 
-    fn handle_get(request: &HttpRequest, session: &mut Session) -> HttpResponse {
+    fn handle_get(&mut self, request: &HttpRequest, session: &mut Session, server_idx: usize) -> HttpResponse {
         // Check for CGI scripts first
-        match Self::try_run_cgi(request) {
+        match self.try_run_cgi(request, server_idx) {
             Ok(Some(resp)) => return resp,
             Ok(None) => {},
             Err(e) => {
@@ -584,9 +648,9 @@ impl Server {
         }
     }
 
-    fn handle_post(request: &HttpRequest, _session: &mut Session) -> HttpResponse {
+    fn handle_post(&mut self, request: &HttpRequest, _session: &mut Session, server_idx: usize) -> HttpResponse {
         // Check for CGI scripts first
-        match Self::try_run_cgi(request) {
+        match self.try_run_cgi(request, server_idx) {
             Ok(Some(resp)) => return resp,
             Ok(None) => {},
             Err(e) => {
@@ -602,6 +666,24 @@ impl Server {
         // Handle POST request - support multipart/form-data file uploads
         if let Some(content_type) = request.headers.get("content-type") {
             if content_type.starts_with("multipart/form-data") {
+                // enforce client_max_body_size
+                let mut limit = self.config.global.as_ref().and_then(|g| g.client_max_body_size).unwrap_or(10 * 1024 * 1024);
+                if let Some(server) = self.config.servers.get(server_idx) {
+                    if let Some(settings) = &server.settings {
+                        if let Some(val) = settings.get("client_max_body_size") {
+                            if let Some(n) = val.as_integer() { limit = n as usize; }
+                        }
+                    }
+                }
+                if request.body.len() > limit {
+                    return HttpResponse {
+                        status: StatusCode::PayloadTooLarge,
+                        content_type: "text/html; charset=utf-8".to_string(),
+                        body: "<html><body><h1>413 Payload Too Large</h1></body></html>".to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+
                 match Self::save_multipart_files(&request.body, content_type) {
                     Ok(files) => {
                         let mut body = String::from("<html><body><h1>Upload Successful</h1><ul>");
@@ -776,7 +858,8 @@ impl Server {
                     if let Some(request) = Self::parse_request(&buffer[..n]) {
                         println!("Received {:?} request for {}", request.method, request.path);
                         
-                        response_to_send = Some(self.handle_request(request));
+                        let server_idx = connection.server_idx;
+                        response_to_send = Some(self.handle_request(request, server_idx));
                     } else {
                         response_to_send = Some(HttpResponse {
                             status: StatusCode::BadRequest,
@@ -996,7 +1079,10 @@ impl Server {
 }
 
 fn main() -> io::Result<()> {
-    let ports = vec![8080, 8000, 8001]; // Multiple ports
-    let mut server = Server::new(&ports)?;
+    // Load configuration from config.toml
+    let cfg_text = std::fs::read_to_string("config.toml").expect("Failed to read config.toml");
+    let config: Config = toml::from_str(&cfg_text).expect("Failed to parse config.toml");
+
+    let mut server = Server::new(config)?;
     server.run()
 }
